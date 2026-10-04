@@ -1,4 +1,4 @@
-import type { WorkspaceDocument } from '../../shared/models'
+import { isPlanSnapshot, type WorkspaceDocument } from '../../shared/models'
 
 export const STORAGE_KEY = 'focusdesk.document.v1'
 const DATABASE_NAME = 'focusdesk-db'
@@ -59,6 +59,13 @@ function writeToDatabase(database: IDBDatabase, value: string): Promise<void> {
 
 export function isWorkspaceDocument(value: unknown): value is WorkspaceDocument {
   if (!value || typeof value !== 'object') return false
-  const candidate = value as Partial<WorkspaceDocument>
-  return candidate.version === 1 && Array.isArray(candidate.plans) && typeof candidate.activePlanId === 'string'
+  const candidate = value as { version?: unknown; plans?: unknown; activePlanId?: unknown }
+  const hasKnownVersion = candidate.version === 1 || candidate.version === 2
+  return hasKnownVersion && Array.isArray(candidate.plans) && typeof candidate.activePlanId === 'string'
+}
+
+export function migrateDocument(value: unknown): WorkspaceDocument | null {
+  if (!isWorkspaceDocument(value)) return null
+  const snapshots = Array.isArray(value.snapshots) ? value.snapshots.filter(isPlanSnapshot) : []
+  return { ...value, version: 2, snapshots }
 }

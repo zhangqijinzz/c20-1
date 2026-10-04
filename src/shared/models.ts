@@ -21,10 +21,26 @@ export interface WorkspacePlan {
   updatedAt: string
 }
 
+export type SnapshotReason = 'auto' | 'manual'
+
+export interface PlanSnapshot {
+  id: string
+  planId: string
+  reason: SnapshotReason
+  label: string | null
+  createdAt: string
+  deviceCount: number
+  deskWidthMm: number
+  deskHeightMm: number
+  issueCount: number
+  plan: WorkspacePlan
+}
+
 export interface WorkspaceDocument {
-  version: 1
+  version: 2
   plans: WorkspacePlan[]
   activePlanId: string
+  snapshots: PlanSnapshot[]
 }
 
 export interface ItemBounds {
@@ -108,5 +124,22 @@ export function createPlan(name = '我的工作台', withDemo = true): Workspace
 
 export function createInitialDocument(): WorkspaceDocument {
   const plan = createPlan('我的工作台', true)
-  return { version: 1, plans: [plan], activePlanId: plan.id }
+  return { version: 2, plans: [plan], activePlanId: plan.id, snapshots: [] }
+}
+
+export function isPlanSnapshot(value: unknown): value is PlanSnapshot {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<PlanSnapshot>
+  const plan = candidate.plan as Partial<WorkspacePlan> | undefined
+  return typeof candidate.id === 'string'
+    && typeof candidate.planId === 'string'
+    && (candidate.reason === 'auto' || candidate.reason === 'manual')
+    && typeof candidate.createdAt === 'string'
+    && typeof candidate.deviceCount === 'number'
+    && typeof candidate.issueCount === 'number'
+    && !!plan
+    && typeof plan.name === 'string'
+    && typeof plan.deskWidthMm === 'number'
+    && typeof plan.deskHeightMm === 'number'
+    && Array.isArray(plan.items)
 }

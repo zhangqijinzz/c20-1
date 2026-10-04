@@ -6,6 +6,7 @@ import {
   type DeskItem,
   type DeviceType,
   type LayoutAnalysis,
+  type PlanSnapshot,
   type WorkspaceDocument,
   type WorkspacePlan,
   type WorkspaceStatus,
@@ -14,6 +15,14 @@ import { clampDeskSize, clampItemDimension } from '../../shared/layoutRules'
 import { moveCanvasItem, rotateCanvasItem } from '../canvas/canvasViewModel'
 import { createMaterialDraft } from '../materials/materialsViewModel'
 import { inspectPlan } from '../inspection/inspectionViewModel'
+import {
+  appendSnapshot,
+  branchSnapshotAsPlan,
+  createSnapshot,
+  listSnapshotsForPlan,
+  restoreSnapshot,
+  shouldAutoSnapshot,
+} from './historyViewModel'
 import { LocalWorkspaceRepository, type WorkspaceRepository } from './workspaceRepository'
 
 export interface WorkspaceViewModel {
@@ -26,6 +35,8 @@ export interface WorkspaceViewModel {
   issueCount: number
   feedback: string
   isPreviewOpen: boolean
+  isHistoryOpen: boolean
+  planSnapshots: PlanSnapshot[]
   selectItem: (id: string | null) => void
   addItem: (type: DeviceType) => void
   removeItem: (id: string) => void
@@ -39,6 +50,12 @@ export interface WorkspaceViewModel {
   deleteCurrentPlan: () => void
   openPreview: () => void
   closePreview: () => void
+  openHistory: () => void
+  closeHistory: () => void
+  saveSnapshot: (label: string) => void
+  restoreSnapshotById: (id: string) => void
+  branchSnapshotById: (id: string) => void
+  deleteSnapshot: (id: string) => void
 }
 
 const emptyInspection = { analysis: { overlapIds: [], outOfBoundsIds: [], coveragePercent: 0, status: 'clear' as const }, issueIds: [], issueCount: 0 }
@@ -49,6 +66,7 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
   const [document, setDocument] = useState<WorkspaceDocument | null>(null)
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null)
   const [isPreviewOpen, setIsPreviewOpen] = useState(false)
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false)
   const [feedback, setFeedback] = useState('正在准备你的工作台…')
 
   useEffect(() => {
@@ -75,6 +93,10 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
   const selectedItem = activePlan?.items.find((item) => item.id === selectedItemId) ?? null
   const inspection = useMemo(() => activePlan ? inspectPlan(activePlan) : emptyInspection, [activePlan])
   const { analysis, issueIds, issueCount } = inspection
+  const planSnapshots = useMemo(
+    () => (document && activePlan ? listSnapshotsForPlan(document.snapshots, activePlan.id) : []),
+    [activePlan, document],
+  )
 
   const persist = useCallback(async (nextDocument: WorkspaceDocument, message: string) => {
     setDocument(nextDocument)
@@ -89,12 +111,30 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     }
   }, [])
 
+  const persistAtomically = useCallback(async (nextDocument: WorkspaceDocument, message: string, failureMessage: string) => {
+    const previousDocument = document
+    setDocument(nextDocument)
+    setStatus('saving')
+    setFeedback(message)
+    try {
+      await repositoryRef.current.save(nextDocument)
+      setStatus('ready')
+    } catch {
+      setDocument(previousDocument)
+      setStatus('error')
+      setFeedback(failureMessage)
+    }
+  }, [document])
+
   const updateActivePlan = useCallback((updater: (plan: WorkspacePlan) => WorkspacePlan, message: string) => {
     if (!document || !activePlan) return
     const nextPlan = { ...updater(activePlan), updatedAt: new Date().toISOString() }
-    const nextDocument = { ...document, plans: document.plans.map((plan) => plan.id === nextPlan.id ? nextPlan : plan) }
+    const snapshots = shouldAutoSnapshot(document.snapshots, activePlan, new Date())
+      ? appendSnapshot(document.snapshots, createSnapshot(activePlan, issueCount, 'auto', null, new Date()))
+      : document.snapshots
+    const nextDocument = { ...document, snapshots, plans: document.plans.map((plan) => plan.id === nextPlan.id ? nextPlan : plan) }
     void persist(nextDocument, message)
-  }, [activePlan, document, persist])
+  }, [activePlan, document, issueCount, persist])
 
   const selectItem = useCallback((id: string | null) => setSelectedItemId(id), [])
 
@@ -167,12 +207,55 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
       return
     }
     const remaining = document.plans.filter((plan) => plan.id !== activePlan.id)
-    void persist({ ...document, plans: remaining, activePlanId: remaining[0].id }, '方案已删除')
+    const snapshots = document.snapshots.filter((snapshot) => snapshot.planId !== activePlan.id)
+    void persist({ ...document, plans: remaining, snapshots, activePlanId: remaining[0].id }, '方案已删除')
     setSelectedItemId(null)
   }, [activePlan, document, persist])
 
   const openPreview = useCallback(() => setIsPreviewOpen(true), [])
   const closePreview = useCallback(() => setIsPreviewOpen(false), [])
+  const openHistory = useCallback(() => setIsHistoryOpen(true), [])
+  const closeHistory = useCallback(() => setIsHistoryOpen(false), [])
+
+  const saveSnapshot = useCallback((label: string) => {
+    if (!document || !activePlan) return
+    const trimmed = label.trim()
+    const snapshot = createSnapshot(activePlan, issueCount, 'manual', trimmed || null, new Date())
+    void persist(
+      { ...document, snapshots: appendSnapshot(document.snapshots, snapshot) },
+      trimmed ? `已留存「${trimmed}」` : '已留存当前状态',
+    )
+  }, [activePlan, document, issueCount, persist])
+
+  const restoreSnapshotById = useCallback((id: string) => {
+    if (!document) return
+    const outcome = restoreSnapshot(document, id, issueCount, new Date())
+    if (!outcome.ok) {
+      setStatus('error')
+      setFeedback(outcome.error)
+      return
+    }
+    void persistAtomically(outcome.document, '已恢复到所选版本', '恢复失败，当前方案已保持原样')
+    setSelectedItemId(null)
+  }, [document, issueCount, persistAtomically])
+
+  const branchSnapshotById = useCallback((id: string) => {
+    if (!document) return
+    const outcome = branchSnapshotAsPlan(document, id, new Date())
+    if (!outcome.ok) {
+      setStatus('error')
+      setFeedback(outcome.error)
+      return
+    }
+    void persistAtomically(outcome.document, '已另存为新方案，可继续编辑', '另存失败，当前方案已保持原样')
+    setSelectedItemId(null)
+    setIsHistoryOpen(false)
+  }, [document, persistAtomically])
+
+  const deleteSnapshot = useCallback((id: string) => {
+    if (!document) return
+    void persist({ ...document, snapshots: document.snapshots.filter((snapshot) => snapshot.id !== id) }, '快照已删除')
+  }, [document, persist])
 
   return {
     status,
@@ -184,6 +267,8 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     issueCount,
     feedback,
     isPreviewOpen,
+    isHistoryOpen,
+    planSnapshots,
     selectItem,
     addItem,
     removeItem,
@@ -197,5 +282,11 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     deleteCurrentPlan,
     openPreview,
     closePreview,
+    openHistory,
+    closeHistory,
+    saveSnapshot,
+    restoreSnapshotById,
+    branchSnapshotById,
+    deleteSnapshot,
   }
 }
